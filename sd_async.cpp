@@ -1,6 +1,5 @@
 #include "sd_async.h"
 #include "config.h"
-#include "logging.h"
 #include <SD.h>
 #include <FS.h>
 #include <freertos/FreeRTOS.h>

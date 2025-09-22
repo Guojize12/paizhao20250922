@@ -1,43 +1,31 @@
 #include "cam_sd.h"
-#include "logging.h"
 #include <SPI.h>
 #include <SD.h>
-#include <Preferences.h>
-#include "upgrade.h" // for prefs
-#include "esp_heap_caps.h"
-#include "esp_system.h"
 #include "config.h"
 #include "sd_async.h"
-
-// 外部符号
-extern void platform_send_image(uint8_t trigger,const uint8_t* jpeg,uint32_t jpegLen,uint32_t frameIndex);
 
 // SPI for SD
 SPIClass sdSPI(VSPI);
 
-// 运行状态
-RunStats g_stats={0};
-RuntimeConfig g_cfg={
-  .sendBeforeSave=DEFAULT_SEND_BEFORE_SAVE,
-  .saveEnabled=true,
-  .sendEnabled=true,
-  .frameHeader=false,
-  .asyncSDWrite=false // 默认关闭异步写，可运行时设置 true
+// 运行时配置：仅保留与SD写入相关
+RuntimeConfig g_cfg = {
+  .saveEnabled   = true,
+  .asyncSDWrite  = true  // 默认启用异步写
 };
-static uint32_t photo_index=1;
-static uint8_t  g_flashDuty=DEFAULT_FLASH_DUTY;
-static uint32_t last_params_saved_ms=0;
 
-bool camera_ok=false;
-static uint32_t camera_reinit_backoff_ms=0;
-static uint32_t camera_next_reinit_allowed=0;
-static uint32_t sd_remount_backoff_ms=3000;
-static uint32_t sd_next_remount_allowed=0;
-static const uint32_t CAMERA_BACKOFF_BASE=3000;
-static const uint32_t CAMERA_BACKOFF_MAX=30000;
-static const uint32_t SD_BACKOFF_MAX=30000;
-uint32_t heap_min_reboot_dynamic=HEAP_MIN_REBOOT;
+static uint32_t photo_index = 1;
+static uint8_t  g_flashDuty = DEFAULT_FLASH_DUTY;
 
+bool camera_ok = false;
+static uint32_t camera_reinit_backoff_ms = 0;
+static uint32_t camera_next_reinit_allowed = 0;
+static uint32_t sd_remount_backoff_ms = 3000;
+static uint32_t sd_next_remount_allowed = 0;
+static const uint32_t CAMERA_BACKOFF_BASE = 3000;
+static const uint32_t CAMERA_BACKOFF_MAX  = 30000;
+static const uint32_t SD_BACKOFF_MAX      = 30000;
+
+// 闪光灯
 void flashInit(){
 #if FLASH_MODE
   ledc_timer_config_t tcfg={
@@ -92,6 +80,7 @@ void flashOff(){
 #endif
 }
 
+// 摄像头配置/初始化
 camera_config_t make_config(framesize_t size,int xclk,int q){
   camera_config_t c;
   c.ledc_channel=LEDC_CHANNEL_0;
@@ -171,7 +160,8 @@ void attempt_camera_reinit_with_backoff(){
   if(!camera_ok) schedule_camera_backoff(); else camera_reinit_backoff_ms=0;
 }
 
-bool save_frame_to_sd_raw(const uint8_t* data,size_t len,uint32_t index){
+// SD 保存
+static bool save_frame_to_sd_raw(const uint8_t* data,size_t len,uint32_t index){
   if(SD.cardType()==CARD_NONE) return false;
   uint64_t free=(SD.totalBytes()-SD.usedBytes());
   if(free/(1024*1024) < SD_MIN_FREE_MB) return false;
@@ -180,31 +170,29 @@ bool save_frame_to_sd_raw(const uint8_t* data,size_t len,uint32_t index){
   size_t w=f.write(data,len); f.close(); return w==len;
 }
 
-// 统一入口：支持同步/异步写
-bool save_frame_to_sd(camera_fb_t *fb,uint32_t index){
+// 同步/异步统一入口
+static bool save_frame_to_sd(camera_fb_t *fb,uint32_t index){
   if(!fb) return false;
   char name[48];
   snprintf(name,sizeof(name),"/photo_%05lu.jpg",(unsigned long)index);
   if(g_cfg.asyncSDWrite){
-    // 异步方式，失败可选择兜底（同步/报警）
     if(sd_async_submit(name, fb->buf, fb->len)){
       return true;
     }else{
       LOG_WARN("[SDASYNC] enq fail, fallback to sync");
-      // 兜底可选：同步写
       return save_frame_to_sd_raw(fb->buf, fb->len, index);
     }
   }else{
-    // 同步写
     return save_frame_to_sd_raw(fb->buf, fb->len, index);
   }
 }
 
+// SD 初始化与周期检查
 void init_sd(){
   sdSPI.begin(SD_SCK,SD_MISO,SD_MOSI,SD_CS);
-  if(!SD.begin(SD_CS,sdSPI)) LOG_WARN("[SD] init fail");
-  else {
-    // SD挂载成功后启动异步写系统（只需调用一次）
+  if(!SD.begin(SD_CS,sdSPI)) {
+    LOG_WARN("[SD] init fail");
+  } else {
     static bool async_started = false;
     if(!async_started){
       sd_async_init();
@@ -219,7 +207,7 @@ void periodic_sd_check(){
   uint32_t now=millis();
   if(SD.cardType()!=CARD_NONE){ sd_remount_backoff_ms=3000; return; }
   if(now<sd_next_remount_allowed) return;
-  sd_async_on_sd_lost(); // SD断开时通知异步系统
+  sd_async_on_sd_lost();
   init_sd();
   if(SD.cardType()==CARD_NONE){
     sd_remount_backoff_ms=min<uint32_t>(sd_remount_backoff_ms*2,SD_BACKOFF_MAX);
@@ -227,94 +215,52 @@ void periodic_sd_check(){
   }else sd_remount_backoff_ms=3000;
 }
 
-void save_params_to_nvs(){
-  prefs.putUChar("flashduty",g_flashDuty);
-  prefs.putUInt("photo_idx",photo_index);
-  last_params_saved_ms=millis();
-}
-void load_params_from_nvs(){
-  g_flashDuty=prefs.getUChar("flashduty",DEFAULT_FLASH_DUTY);
-  photo_index=prefs.getUInt("photo_idx",1);
-  if(photo_index==0) photo_index=1;
-  last_params_saved_ms=millis();
-}
-
-void handle_camera_failure(){
-  g_stats.failed_captures++; g_stats.consecutive_capture_fail++;
-  if(ENABLE_AUTO_REINIT && g_stats.consecutive_capture_fail>=RUNTIME_FAIL_REINIT_THRESHOLD)
-    attempt_camera_reinit_with_backoff();
-  if(g_stats.consecutive_capture_fail>=CAPTURE_FAIL_REBOOT_THRESHOLD){
-    LOG_FATAL("[CAM] too many fails"); delay(500); ESP.restart();
-  }
-}
-void handle_sd_failure(){
-  g_stats.consecutive_sd_fail++;
-  if(g_stats.consecutive_sd_fail>=SD_FAIL_REBOOT_THRESHOLD){
-    LOG_FATAL("[SD] too many fails"); delay(500); ESP.restart();
-  }
-}
-void check_and_reboot_on_low_heap(){
-  uint32_t freeH=esp_get_free_heap_size();
-  if(freeH<heap_min_reboot_dynamic){
-    LOG_FATAL("[MEM] low"); delay(500); ESP.restart();
-  }
-}
-
-uint8_t capture_once_internal(uint8_t trigger){
-#if UPGRADE_ENABLE
-  if(g_upg.state==UPG_DOWNLOADING || g_upg.state==UPG_FILE_INFO){
-    if(g_debugMode) LOG_WARN("[CAP] blocked by upgrade"); return CR_CAMERA_NOT_READY;
-  }
-#endif
+// 单次拍照
+static uint8_t capture_once_internal(uint8_t /*trigger*/){
   if(!camera_ok) return CR_CAMERA_NOT_READY;
+
   if(DISCARD_FRAMES_EACH_SHOT>0) discard_frames(DISCARD_FRAMES_EACH_SHOT);
+
   flashOn();
 #if FLASH_MODE
   delay(FLASH_WARM_MS);
 #else
   delay(FLASH_ON_TIME_MS_DIGITAL);
 #endif
+
   camera_fb_t *fb=esp_camera_fb_get();
   if(!fb){
     delay(20); fb=esp_camera_fb_get();
     if(!fb){ flashOff(); return CR_FRAME_GRAB_FAIL; }
   }
+
   uint32_t frame_len=fb->len;
   uint32_t index=photo_index;
   bool sdOk=true;
 
-  if(g_cfg.sendEnabled && g_cfg.sendBeforeSave)
-    platform_send_image(trigger,fb->buf,fb->len,index);
   if(g_cfg.saveEnabled) sdOk=save_frame_to_sd(fb,index);
-  if(g_cfg.sendEnabled && !g_cfg.sendBeforeSave)
-    platform_send_image(trigger,fb->buf,fb->len,index);
 
   if(sdOk || !g_cfg.saveEnabled){
     photo_index++;
-    if(photo_index % SAVE_PARAMS_INTERVAL_IMAGES==0) save_params_to_nvs();
-    else if(millis()-last_params_saved_ms >= NVS_MIN_SAVE_INTERVAL_MS) save_params_to_nvs();
   }
+
   esp_camera_fb_return(fb);
   flashOff();
 
-  g_stats.total_captures++;
-  g_stats.last_frame_size=frame_len;
-  g_stats.last_capture_ms=millis();
+  (void)frame_len; // 若需要可用于日志
   if(!sdOk && g_cfg.saveEnabled) return CR_SD_SAVE_FAIL;
-  check_and_reboot_on_low_heap();
   return CR_OK;
 }
 
 bool capture_and_process(uint8_t trigger){
   uint8_t r=capture_once_internal(trigger);
   if(r!=CR_OK){
-    if(r==CR_FRAME_GRAB_FAIL) handle_camera_failure();
-    else if(r==CR_SD_SAVE_FAIL) handle_sd_failure();
-    else if(r==CR_CAMERA_NOT_READY && camera_ok==false) attempt_camera_reinit_with_backoff();
+    if(r==CR_CAMERA_NOT_READY && camera_ok==false){
+      attempt_camera_reinit_with_backoff();
+    }else if(r==CR_FRAME_GRAB_FAIL && ENABLE_AUTO_REINIT){
+      attempt_camera_reinit_with_backoff();
+    }
     return false;
-  }else{
-    g_stats.consecutive_capture_fail=0;
-    g_stats.consecutive_sd_fail=0;
   }
   return true;
 }
