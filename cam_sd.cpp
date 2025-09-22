@@ -104,7 +104,7 @@ camera_config_t make_config(framesize_t size,int xclk,int q){
 bool try_camera_init_once(framesize_t size,int xclk,int q){
   camera_config_t cfg=make_config(size,xclk,q);
   esp_err_t err=esp_camera_init(&cfg);
-  if(err!=ESP_OK) LOG_WARN("[CAM] init err=0x%X",(unsigned)err);
+
   return err==ESP_OK;
 }
 
@@ -138,14 +138,14 @@ bool reinit_camera_with_params(framesize_t size,int quality){
   deinit_camera_silent();
   camera_config_t cfg=make_config(size,20000000,quality);
   if(esp_camera_init(&cfg)==ESP_OK){
-    camera_ok=true; LOG_INFO("[CAM] reinit fast OK size=%d q=%d",(int)size,quality); return true;
+
   }
   deinit_camera_silent();
   cfg=make_config(size,10000000,quality+2);
   if(esp_camera_init(&cfg)==ESP_OK){
-    camera_ok=true; LOG_INFO("[CAM] reinit slow OK size=%d q=%d",(int)size,quality+2); return true;
+
   }
-  camera_ok=false; LOG_WARN("[CAM] reinit fail size=%d q=%d",(int)size,quality); return false;
+
 }
 
 void schedule_camera_backoff(){
@@ -179,7 +179,7 @@ static bool save_frame_to_sd(camera_fb_t *fb,uint32_t index){
     if(sd_async_submit(name, fb->buf, fb->len)){
       return true;
     }else{
-      LOG_WARN("[SDASYNC] enq fail, fallback to sync");
+
       return save_frame_to_sd_raw(fb->buf, fb->len, index);
     }
   }else{
@@ -191,7 +191,7 @@ static bool save_frame_to_sd(camera_fb_t *fb,uint32_t index){
 void init_sd(){
   sdSPI.begin(SD_SCK,SD_MISO,SD_MOSI,SD_CS);
   if(!SD.begin(SD_CS,sdSPI)) {
-    LOG_WARN("[SD] init fail");
+
   } else {
     static bool async_started = false;
     if(!async_started){

@@ -62,7 +62,7 @@ static void pool_init(){
     void* mem = heap_caps_malloc(alloc_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if(!mem) mem = heap_caps_malloc(alloc_size, MALLOC_CAP_8BIT);
     if(!mem){
-      if(LOG_ENABLED()) LOG_WARN("[ASD] pool alloc blk %u fail", i);
+ 
       continue;
     }
     PoolBlk* b = (PoolBlk*)mem;
